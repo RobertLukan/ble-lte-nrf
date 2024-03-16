@@ -1,70 +1,41 @@
-/* Copyright (c) 2022 Nordic Semiconductor ASA
+/* Copyright (c) 2023 Nordic Semiconductor ASA
  *
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <modem/location.h>
-#include <nrf_modem_at.h>
-#include <nrf_errno.h>
-#include <net/nrf_cloud.h>
-#include <net/nrf_cloud_alert.h>
+#include <zephyr/logging/log_ctrl.h>
 #include <date_time.h>
-#include <cJSON.h>
 #include <stdio.h>
-
+#include <net/nrf_cloud.h>
 #include <net/nrf_cloud_codec.h>
+#include <net/nrf_cloud_log.h>
+#include <net/nrf_cloud_alert.h>
+#if defined(CONFIG_NRF_CLOUD_COAP)
+#include <net/nrf_cloud_coap.h>
+#endif
+#if defined(CONFIG_LOCATION_TRACKING)
+#include <modem/location.h>
+#include "location_tracking.h"
+#endif
 #include "application.h"
 #include "temperature.h"
-#include "connection.h"
-
-#include "location_tracking.h"
+#include "cloud_connection.h"
+#include "message_queue.h"
 #include "led_control.h"
+#include "at_commands.h"
+
+
+
 #include <zephyr/net/socket.h>
-
-
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <bluetooth/gatt_dm.h>
 #include <bluetooth/scan.h>
 
-#include <dk_buttons_and_leds.h>
-#include <zephyr/sys/byteorder.h>
-
-#include <net/nrf_cloud.h>
-#include <zephyr/logging/log.h>
-
-#include <zephyr/types.h>
-#include <string.h>
-#include <zephyr/irq.h>
-
-#include "aggregator.h"
-#include "ble.h"
-#include "alarm.h"
-
-#include <zephyr/drivers/sensor.h>
-
-#if DT_ANY_INST_ON_BUS_STATUS_OKAY(spi)
-#include <zephyr/drivers/spi.h>
-#endif /* DT_ANY_INST_ON_BUS_STATUS_OKAY(spi) */
-
-#if DT_ANY_INST_ON_BUS_STATUS_OKAY(i2c)
-#include <zephyr/drivers/i2c.h>
-#endif /* DT_ANY_INST_ON_BUS_STATUS_OKAY(i2c) */
-
-#define UDP_IP_HEADER_SIZE 28
-
-static int client_fd;
-static struct sockaddr_storage host_addr;
-static struct k_work_delayable server_transmission_work;
-int16_t bat_voltage = 0;
-int16_t modem_rsrp = 0;
-int64_t timestamp;
-
-
-LOG_MODULE_REGISTER(application, CONFIG_MQTT_MULTI_SERVICE_LOG_LEVEL);
+LOG_MODULE_REGISTER(application, CONFIG_MULTI_SERVICE_LOG_LEVEL);
 
 /* Timer used to time the sensor sampling rate. */
 static K_TIMER_DEFINE(sensor_sample_timer, NULL, NULL);
@@ -76,56 +47,21 @@ BUILD_ASSERT(CONFIG_AT_CMD_REQUEST_RESPONSE_BUFFER_LENGTH >= AT_CMD_REQUEST_ERR_
 	     "Not enough AT command response buffer for printing error events.");
 
 /* Temperature alert limits. */
-#define TEMP_ALERT_LIMIT CONFIG_TEMP_ALERT_LIMIT
-#define TEMP_ALERT_HYSTERESIS 2
-#define TEMP_ALERT_LOWER_LIMIT (TEMP_ALERT_LIMIT + TEMP_ALERT_HYSTERESIS)
+#define TEMP_ALERT_LIMIT ((float)CONFIG_TEMP_ALERT_LIMIT)
+#define TEMP_ALERT_HYSTERESIS 1.5f
+#define TEMP_ALERT_LOWER_LIMIT (TEMP_ALERT_LIMIT - TEMP_ALERT_HYSTERESIS)
 
-/* Buffer to contain modem responses when performing AT command requests */
-static char at_req_resp_buf[CONFIG_AT_CMD_REQUEST_RESPONSE_BUFFER_LENGTH];
-
-/**
- * @brief Construct a device message cJSON object with automatically generated timestamp
- *
- * The resultant cJSON object will be conformal to the General Message Schema described in the
- * application-protocols repo:
- *
- * https://github.com/nRFCloud/application-protocols
- *
- * @param appid - The appId for the device message
- * @param msg_type - The messageType for the device message
- * @return cJSON* - the timestamped data device message object if successful, NULL otherwise.
- */
-
-#include <psa/crypto.h>
-#include <psa/crypto_extra.h>
-#include <zephyr/logging/log.h>
-
-#ifdef CONFIG_BUILD_WITH_TFM
-#include <tfm_ns_interface.h>
-#endif
-
-#define APP_SUCCESS		0
-#define APP_ERROR		-1
-#define APP_SUCCESS_MESSAGE "Example finished successfully!"
-#define APP_ERROR_MESSAGE "Example exited with error!"
-
-#define PRINT_HEX(p_label, p_text, len)\
-	({\
-		LOG_INF("---- %s (len: %u): ----", p_label, len);\
-		LOG_HEXDUMP_INF(p_text, len, "Content:");\
-		LOG_INF("---- %s end  ----", p_label);\
-	})
+#define UDP_IP_HEADER_SIZE 28
 
 
-/* ====================================================================== */
-/*				Global variables/defines for the SHA256 example			  */
+static int client_fd;
+static struct sockaddr_storage host_addr;
+static struct k_work_delayable server_transmission_work;
+int16_t bat_voltage = 0;
+int16_t modem_rsrp = 0;
+int64_t timestamp;
 
-#define NRF_CRYPTO_EXAMPLE_SHA256_TEXT_SIZE 150
-#define NRF_CRYPTO_EXAMPLE_SHA256_SIZE 32
-
-cJSON * json_create_req_obj(const char *const appid, const char *const msg_type);
 struct subscribed_peer subscribed_peers[20];
-
 double temp;
 
 static int server_init(void)
@@ -256,34 +192,53 @@ static void server_transmission_work_fn(struct k_work *work)
 }
 
 
-static cJSON *create_timestamped_device_message(const char *const appid, const char *const msg_type)
+
+/**
+ * @brief Construct a device message object with automatically generated timestamp
+ *
+ * The resultant JSON object will be conformal to the General Message Schema described in the
+ * application-protocols repo:
+ *
+ * https://github.com/nRFCloud/application-protocols
+ *
+ * @param msg - The object to contain the message
+ * @param appid - The appId for the device message
+ * @param msg_type - The messageType for the device message
+ * @return int - 0 on success, negative error code otherwise.
+ */
+static int create_timestamped_device_message(struct nrf_cloud_obj *const msg,
+					     const char *const appid,
+					     const char *const msg_type)
 {
-	cJSON *msg_obj = NULL;
+	int err;
+	int64_t timestamp;
 
 	/* Acquire timestamp */
-	if (date_time_now(&timestamp)) {
-		LOG_ERR("Failed to create timestamp for data message "
-			"with appid %s", appid);
-		return NULL;
+	err = date_time_now(&timestamp);
+	if (err) {
+		LOG_ERR("Failed to obtain current time, error %d", err);
+		return -ETIME;
 	}
 
-	/* Create container object */
-	msg_obj = json_create_req_obj(appid, msg_type);
-	if (msg_obj == NULL) {
-		LOG_ERR("Failed to create container object for timestamped data message "
-			"with appid %s and message type %s", appid, msg_type);
-		return NULL;
-	}
-
-	/* Add timestamp to container object */
-	if (!cJSON_AddNumberToObject(msg_obj, NRF_CLOUD_MSG_TIMESTAMP_KEY, (double)timestamp)) {
-		LOG_ERR("Failed to add timestamp to data message with appid %s and message type %s",
+	/* Create message object */
+	err = nrf_cloud_obj_msg_init(msg, appid,
+				     IS_ENABLED(CONFIG_NRF_CLOUD_COAP) ? NULL : msg_type);
+	if (err) {
+		LOG_ERR("Failed to initialize message with appid %s and msg type %s",
 			appid, msg_type);
-		cJSON_Delete(msg_obj);
-		return NULL;
+		return err;
 	}
 
-	return msg_obj;
+	/* Add timestamp to message object */
+	err = nrf_cloud_obj_ts_add(msg, timestamp);
+	if (err) {
+		LOG_ERR("Failed to add timestamp to data message with appid %s and msg type %s",
+			appid, msg_type);
+		nrf_cloud_obj_free(msg);
+		return err;
+	}
+
+	return 0;
 }
 
 /**
@@ -295,36 +250,31 @@ static cJSON *create_timestamped_device_message(const char *const appid, const c
  */
 static int send_sensor_sample(const char *const sensor, double value)
 {
-	int ret = 0;
+	int ret;
+
+	MSG_OBJ_DEFINE(msg_obj);
 
 	/* Create a timestamped message container object for the sensor sample. */
-	cJSON *msg_obj = create_timestamped_device_message(
-		sensor, NRF_CLOUD_JSON_MSG_TYPE_VAL_DATA
-	);
-
-	if (msg_obj == NULL) {
-		ret = -EINVAL;
-		goto cleanup;
+	ret = create_timestamped_device_message(&msg_obj, sensor,
+						NRF_CLOUD_JSON_MSG_TYPE_VAL_DATA);
+	if (ret) {
+		return -EINVAL;
 	}
 
 	/* Populate the container object with the sensor value. */
-	if (cJSON_AddNumberToObject(msg_obj, NRF_CLOUD_JSON_DATA_KEY, value) == NULL) {
-		ret = -ENOMEM;
+	ret = nrf_cloud_obj_num_add(&msg_obj, NRF_CLOUD_JSON_DATA_KEY, value, false);
+	if (ret) {
 		LOG_ERR("Failed to append value to %s sample container object ",
 			sensor);
-		goto cleanup;
+		nrf_cloud_obj_free(&msg_obj);
+		return -ENOMEM;
 	}
 
 	/* Send the sensor sample container object as a device message. */
-	ret = send_device_message_cJSON(msg_obj);
-
-cleanup:
-	if (msg_obj) {
-		cJSON_Delete(msg_obj);
-	}
-	return ret;
+	return send_device_message(&msg_obj);
 }
 
+#if defined(CONFIG_LOCATION_TRACKING)
 /**
  * @brief Transmit a collected GNSS sample to nRF Cloud.
  *
@@ -333,11 +283,12 @@ cleanup:
  */
 static int send_gnss(const struct location_event_data * const loc_gnss)
 {
+	int ret;
+
 	if (!loc_gnss || (loc_gnss->method != LOCATION_METHOD_GNSS)) {
 		return -EINVAL;
 	}
 
-	int ret = 0;
 	struct nrf_cloud_gnss_data gnss_pvt = {
 		.type = NRF_CLOUD_GNSS_TYPE_PVT,
 		.ts_ms = NRF_CLOUD_NO_TIMESTAMP,
@@ -350,22 +301,17 @@ static int send_gnss(const struct location_event_data * const loc_gnss)
 			.has_heading	= 0
 		}
 	};
-
-	cJSON *msg_obj = cJSON_CreateObject();
+	MSG_OBJ_DEFINE(msg_obj);
 
 	/* Add the timestamp */
 	(void)date_time_now(&gnss_pvt.ts_ms);
 
 	/* Encode the location data into a device message */
-	ret = nrf_cloud_gnss_msg_json_encode(&gnss_pvt, msg_obj);
+	ret = nrf_cloud_obj_gnss_msg_create(&msg_obj, &gnss_pvt);
 
 	if (ret == 0) {
 		/* Send the location message */
-		ret = send_device_message_cJSON(msg_obj);
-	}
-
-	if (msg_obj) {
-		cJSON_Delete(msg_obj);
+		ret = send_device_message(&msg_obj);
 	}
 
 	return ret;
@@ -397,6 +343,7 @@ static void on_location_update(const struct location_event_data * const location
 		send_gnss(location_data);
 	}
 }
+#endif /* CONFIG_LOCATION_TRACKING */
 
 /**
  * @brief Receives general device messages from nRF Cloud, checks if they are AT command requests,
@@ -407,92 +354,78 @@ static void on_location_update(const struct location_event_data * const location
  *
  * @param msg - The device message to check.
  */
-static void handle_at_cmd_requests(const char *const msg)
+static void handle_at_cmd_requests(const struct nrf_cloud_data *const dev_msg)
 {
-	/* Attempt to parse the message as if it is JSON */
-	struct cJSON *msg_obj = cJSON_Parse(msg);
+	char *cmd;
+	struct nrf_cloud_obj msg_obj;
+	int err = nrf_cloud_obj_input_decode(&msg_obj, dev_msg);
 
-	if (!msg_obj) {
+	if (err) {
 		/* The message isn't JSON or otherwise couldn't be parsed. */
 		LOG_DBG("A general topic device message of length %d could not be parsed.",
-			msg ? strlen(msg) : 0);
+			dev_msg->len);
 		return;
 	}
 
-	/* Check that we are actually dealing with an AT command request */
-	char *msg_appid =
-		cJSON_GetStringValue(cJSON_GetObjectItem(msg_obj, NRF_CLOUD_JSON_APPID_KEY));
-	char *msg_type =
-		cJSON_GetStringValue(cJSON_GetObjectItem(msg_obj, NRF_CLOUD_JSON_MSG_TYPE_KEY));
-	if (!msg_appid || !msg_type ||
-	    (strcmp(msg_appid, NRF_CLOUD_JSON_APPID_VAL_MODEM)  != 0) ||
-	    (strcmp(msg_type,  NRF_CLOUD_JSON_MSG_TYPE_VAL_CMD) != 0)) {
+	/* Confirm app ID and message type */
+	err = nrf_cloud_obj_msg_check(&msg_obj, NRF_CLOUD_JSON_APPID_VAL_MODEM,
+				      NRF_CLOUD_JSON_MSG_TYPE_VAL_CMD);
+	if (err) {
 		goto cleanup;
 	}
 
-	/* If it is, extract the command string */
-	char *cmd =
-		cJSON_GetStringValue(cJSON_GetObjectItem(msg_obj, NRF_CLOUD_JSON_DATA_KEY));
-
-	if (!cmd) {
+	/* Get the command string */
+	err = nrf_cloud_obj_str_get(&msg_obj, NRF_CLOUD_JSON_DATA_KEY, &cmd);
+	if (err) {
 		/* Missing or invalid command value will be treated as a blank command */
 		cmd = "";
 	}
 
 	/* Execute the command and receive the result */
-	LOG_DBG("Modem AT command requested: %s", cmd);
-	memset(at_req_resp_buf, 0, sizeof(at_req_resp_buf));
+	char *response = execute_at_cmd_request(cmd);
 
-	/* We must pass the command in using a format specifier it might contain special characters
-	 * such as %.
-	 *
-	 * We subtract 1 from the passed-in response buffer length to ensure that the response is
-	 * always null-terminated, even when the response is longer than the response buffer size.
+	/* To re-use msg_obj for the response message we must first free its memory and
+	 * reset its state.
+	 * The cmd string will no longer be valid after msg_obj is freed.
 	 */
-	int err = nrf_modem_at_cmd(at_req_resp_buf, sizeof(at_req_resp_buf) - 1, "%s", cmd);
-
-	LOG_DBG("Modem AT command response (%d, %d): %s",
-		nrf_modem_at_err_type(err), nrf_modem_at_err(err), at_req_resp_buf);
-
-	/* Trim \r\n from modem response for better readability in the portal. */
-	at_req_resp_buf[MAX(0, strlen(at_req_resp_buf) - 2)] = '\0';
-
-	/* If an error occurred with the request, report it */
-	if (err < 0) {
-		/* Negative error codes indicate an error with the modem lib itself, so the
-		 * response buffer will be empty (or filled with junk). Thus, we can print the
-		 * error message directly into it.
-		 */
-		snprintf(at_req_resp_buf, sizeof(at_req_resp_buf), AT_CMD_REQUEST_ERR_FORMAT, err);
-		LOG_ERR("%s", at_req_resp_buf);
+	cmd = NULL;
+	/* Free the object's allocated memory */
+	err = nrf_cloud_obj_free(&msg_obj);
+	if (err) {
+		LOG_ERR("Failed to free AT CMD request");
+		return;
 	}
 
-	/* Free the old container object and create a new one to contain our response */
-	cJSON_Delete(msg_obj);
-	msg_obj = create_timestamped_device_message(
-		NRF_CLOUD_JSON_APPID_VAL_MODEM,
-		NRF_CLOUD_JSON_MSG_TYPE_VAL_DATA
-	);
+	/* Reset the object's state */
+	err = nrf_cloud_obj_reset(&msg_obj);
+	if (err) {
+		LOG_ERR("Failed to reset AT CMD request message object for reuse");
+		return;
+	}
 
-	if (!msg_obj) {
+	err = create_timestamped_device_message(&msg_obj, NRF_CLOUD_JSON_APPID_VAL_MODEM,
+						NRF_CLOUD_JSON_MSG_TYPE_VAL_DATA);
+	if (err) {
 		return;
 	}
 
 	/* Populate response with command result */
-	if (!cJSON_AddStringToObject(msg_obj, NRF_CLOUD_JSON_DATA_KEY, at_req_resp_buf)) {
+	err = nrf_cloud_obj_str_add(&msg_obj, NRF_CLOUD_JSON_DATA_KEY, response, false);
+	if (err) {
 		LOG_ERR("Failed to populate AT CMD response with modem response data");
 		goto cleanup;
 	}
 
 	/* Send the response */
-	err = send_device_message_cJSON(msg_obj);
-
+	err = send_device_message(&msg_obj);
 	if (err) {
 		LOG_ERR("Failed to send AT CMD request response, error: %d", err);
 	}
 
+	return;
+
 cleanup:
-	cJSON_Delete(msg_obj);
+	(void)nrf_cloud_obj_free(&msg_obj);
 }
 
 /** @brief Check whether temperature is acceptable.
@@ -513,25 +446,25 @@ static void monitor_temperature(double temp)
 		temperature_alert_active = true;
 		(void)nrf_cloud_alert_send(ALERT_TYPE_TEMPERATURE, (float)temp,
 					   "Temperature over limit!");
-	} else if (temp < TEMP_ALERT_LOWER_LIMIT) {
+		LOG_INF("Temperature limit %f C exceeded: now %f C.",
+			TEMP_ALERT_LIMIT, temp);
+	} else if ((temp < TEMP_ALERT_LOWER_LIMIT) && temperature_alert_active) {
 		temperature_alert_active = false;
+		LOG_INF("Temperature now below limit: %f C.", temp);
 	}
 }
 
-
 void main_application_thread_fn(void)
 {
-
 	if (IS_ENABLED(CONFIG_AT_CMD_REQUESTS)) {
 		/* Register with connection.c to receive general device messages and check them for
 		 * AT command requests.
 		 */
 		register_general_dev_msg_handler(handle_at_cmd_requests);
 	}
-	int err;
 
 	/* Wait for first connection before starting the application. */
-	(void)await_connection(K_FOREVER);
+	(void)await_cloud_ready(K_FOREVER);
 
 	(void)nrf_cloud_alert_send(ALERT_TYPE_DEVICE_NOW_ONLINE, 0, NULL);
 
@@ -545,16 +478,33 @@ void main_application_thread_fn(void)
 		LOG_INF("Current date and time determined");
 	}
 
+	const char *protocol = "";
+
+	if (IS_ENABLED(CONFIG_NRF_CLOUD_MQTT)) {
+		protocol = "MQTT";
+	} else if (IS_ENABLED(CONFIG_NRF_CLOUD_COAP)) {
+		protocol = "CoAP";
+	}
+	nrf_cloud_log_init();
+	nrf_cloud_log_control_set(CONFIG_NRF_CLOUD_LOG_OUTPUT_LEVEL);
+	/* Send a direct log to the nRF Cloud web portal indicating the sample has started up. */
+	(void)nrf_cloud_log_send(LOG_LEVEL_INF,
+				 "nRF Cloud multi-service sample has started, "
+				 "version: %s, protocol: %s",
+				 CONFIG_APP_VERSION, protocol);
+
+#if defined(CONFIG_LOCATION_TRACKING)
 	/* Begin tracking location at the configured interval. */
 	(void)start_location_tracking(on_location_update,
 					CONFIG_LOCATION_TRACKING_SAMPLE_INTERVAL_SECONDS);
+#endif
+	int counter = 0;
 
-//	int counter = 0;
 	k_work_init_delayable(&server_transmission_work,
 			      server_transmission_work_fn);
 
 
-	err = server_init();
+	int err = server_init();
 	if (err) {
 		LOG_ERR("Not able to initialize UDP server connection\n");
 	//	return;
@@ -569,33 +519,36 @@ void main_application_thread_fn(void)
 
 
 	k_work_schedule(&server_transmission_work, K_NO_WAIT);
+
 	/* Begin sampling sensors. */
 	while (true) {
+		/* Start the sensor sample interval timer.
+		 * We use a timer here instead of merely sleeping the thread, because the
+		 * application thread can be preempted by other threads performing long tasks
+		 * (such as periodic location acquisition), and we want to account for these
+		 * delays when metering the sample send rate.
+		 */
 		k_timer_start(&sensor_sample_timer,
 			K_SECONDS(CONFIG_SENSOR_SAMPLE_INTERVAL_SECONDS), K_FOREVER);
 
 		if (IS_ENABLED(CONFIG_TEMP_TRACKING)) {
-			temp = -1;
+			double temp = -1;
 
 			if (get_temperature(&temp) == 0) {
 				LOG_INF("Temperature is %d degrees C", (int)temp);
-			//	(void)send_sensor_sample(NRF_CLOUD_JSON_APPID_VAL_TEMP, temp);
-			//	strncpy(newMess.temperatureLocal, temp,sizeof(temp));
-		//		newMess.temperatureLocal = temp;
-		//		monitor_temperature(temp);
+		//		(void)send_sensor_sample(NRF_CLOUD_JSON_APPID_VAL_TEMP, temp);
 				subscribed_peers[0].temp_celsius = temp;
 
+		//		monitor_temperature(temp);
 			}
 		}
 
-	//	if (IS_ENABLED(CONFIG_TEST_COUNTER)) {
-	//		(void)send_sensor_sample("COUNT", counter++);
-	//	}
+		if (IS_ENABLED(CONFIG_TEST_COUNTER)) {
+			LOG_INF("Sent test counter = %d", counter);
+			(void)send_sensor_sample("COUNT", counter++);
+		}
 
 		/* Wait out any remaining time on the sample interval timer. */
 		k_timer_status_sync(&sensor_sample_timer);
 	}
 }
-
-
-

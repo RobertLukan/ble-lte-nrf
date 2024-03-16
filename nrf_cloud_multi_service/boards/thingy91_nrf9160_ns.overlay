@@ -16,7 +16,7 @@
 };
 
 &uart0 {
-	current-speed = <1000000>;
+	current-speed = <115200>;
 	status = "okay";
 	/delete-property/ hw-flow-control;
 

@@ -18,27 +18,9 @@
 #include <net/nrf_cloud.h>
 #include <zephyr/logging/log.h>
 #include "aggregator.h"
-#include "application.h"
 
-
-#include <date_time.h>
-
-
-extern struct subscribed_peer subscribed_peers[CONFIG_BT_MAX_PAIRED];
-
-bt_addr_le_t set_addr = {
-	.type = 0,
-	.a =  { {0xE9, 0xD6, 0xAF, 0x57, 0xD4, 0xEC} } ,
-};
-
-bt_addr_le_t addr = {
-		.type		= BT_ADDR_LE_RANDOM,
-		.a.val		= {0xba, 0xde, 0xba, 0x11, 0xca, 0xfe},
-	};
-
-LOG_MODULE_REGISTER(lte_ble_gw, CONFIG_MQTT_MULTI_SERVICE_LOG_LEVEL);
-
-
+//LOG_MODULE_DECLARE(lte_ble_gw);
+LOG_MODULE_REGISTER(lte_ble_gw, CONFIG_MULTI_SERVICE_LOG_LEVEL);
 
 /* Thinghy advertisement UUID */
 #define BT_UUID_THINGY_VAL \
@@ -59,25 +41,143 @@ LOG_MODULE_REGISTER(lte_ble_gw, CONFIG_MQTT_MULTI_SERVICE_LOG_LEVEL);
 #define BT_UUID_TOC \
 	BT_UUID_DECLARE_128(BT_UUID_TOC_VAL)
 extern void alarm(void);
+#include "application.h"
 
-static uint8_t on_received(struct bt_conn *conn,
-			struct bt_gatt_subscribe_params *params,
-			const void *data, uint16_t length)
-			{
-				return BT_GATT_ITER_CONTINUE;
-			}
+
+#include <date_time.h>
+
+void ble_init(void);
+extern struct subscribed_peer subscribed_peers[CONFIG_BT_MAX_PAIRED];
+
+bt_addr_le_t set_addr = {
+	.type = 0,
+	.a =  { {0xE9, 0xD6, 0xAF, 0x57, 0xD4, 0xEC} } ,
+};
+
+bt_addr_le_t addr = {
+		.type		= BT_ADDR_LE_RANDOM,
+		.a.val		= {0xba, 0xde, 0xba, 0x11, 0xca, 0xfe},
+	};
+
+
 
 static void reset_subscribers(void)
 {
 	for (size_t i = 1; i < 20; i++) {
 		bt_addr_le_copy(&subscribed_peers[i].addr, BT_ADDR_LE_NONE);
 	}
-
 }
+
+static uint8_t on_received(struct bt_conn *conn,
+			struct bt_gatt_subscribe_params *params,
+			const void *data, uint16_t length)
+{
+	if (length > 0) {
+		LOG_INF("Orientation: %x", ((uint8_t *)data)[0]);
+		struct sensor_data in_data;
+
+		in_data.type = THINGY_ORIENTATION;
+		in_data.length = 1;
+		in_data.data[0] = ((uint8_t *)data)[0];
+
+		if (aggregator_put(in_data) != 0) {
+			LOG_ERR("Was not able to insert Thingy orientation data into aggregator");
+		}
+		/* If the thingy is upside down, trigger an alarm. */
+		if (((uint8_t *)data)[0] == 3) {
+			alarm();
+		}
+
+	} else {
+		LOG_DBG("Orientation notification with 0 length");
+	}
+	return BT_GATT_ITER_CONTINUE;
+}
+
+
+bool find_adv_data(struct bt_data *data, void *user_data)
+{
+    if(data->type == 22)
+	{
+
+		int  subscriber  = (int)user_data;
+		int oldCounter = subscribed_peers[subscriber].counter;
+  		const uint8_t protocol_version = data->data[2] >> 4;
+		subscribed_peers[subscriber].protocol_version = protocol_version;
+
+
+  		uint8_t counter = data->data[3] & 0x0f;
+		if(oldCounter==counter)
+		{
+			return true;
+		}
+
+		LOG_INF("Counter: %u", counter);
+		subscribed_peers[subscriber].counter = counter;
+
+
+// Some b-parasite versions have an (optional) illuminance sensor.
+  		bool has_illuminance = data->data[2] & 0x1;
+		subscribed_peers[subscriber].has_illuminance = has_illuminance;
+
+		LOG_INF("Illuminance support: %u", has_illuminance);
+  // Counter for deduplicating messages.
+
+	// Battery voltage in millivolts.
+  		uint16_t battery_millivolt = data->data[4] << 8 | data->data[5];
+  		float battery_voltage = battery_millivolt / 1000.0f;
+		LOG_INF("Battery voltage: %.2f", battery_voltage);
+		subscribed_peers[subscriber].battery_voltage = battery_millivolt;
+
+// Temperature in 1000 * Celsius (protocol v1) or 100 * Celsius (protocol v2).
+  		float temp_celsius;
+	//	uint16_t temp_millicelsius;
+  		if (protocol_version == 1) {
+    		uint16_t temp_millicelsius = data->data[6] << 8 | data->data[7];
+    		temp_celsius = temp_millicelsius / 1000.0f;
+  		} else {
+    		int16_t temp_centicelsius = data->data[6] << 8 | data->data[7];
+    		temp_celsius = temp_centicelsius / 100.0f;
+  		}
+		LOG_INF("Temp: %.2f", temp_celsius);
+		subscribed_peers[subscriber].temp_celsius = temp_celsius;
+
+// Relative air humidity in the range [0, 2^16).
+  		uint16_t humidity = data->data[8] << 8 | data->data[9];
+  		float humidity_percent = (100.0f * humidity) / (1 << 16);
+		LOG_INF("Humidity: %.2f", humidity_percent);
+		subscribed_peers[subscriber].humidity_percent = humidity_percent;
+
+  // Relative soil moisture in [0 - 2^16).
+  		uint16_t soil_moisture = data->data[10] << 8 | data->data[11];
+  		float moisture_percent = (100.0f * soil_moisture) / (1 << 16);
+		LOG_INF("Moisture: %.2f", moisture_percent);
+		subscribed_peers[subscriber].moisture_percent = moisture_percent;
+
+  // Ambient light in lux.
+  		float illuminance = has_illuminance ? data->data[18] << 8 | data->data[19] : 0.0f;
+		LOG_INF("Illuminance: %.2f", illuminance);
+		subscribed_peers[subscriber].illuminance = illuminance;
+
+
+		if(date_time_is_valid())
+		{
+			int64_t timestamp;
+			date_time_now(&timestamp);
+			LOG_INF("DateTime valid");
+			subscribed_peers[subscriber].has_timestamp = true;
+			subscribed_peers[subscriber].timestamp = timestamp;
+		}
+	
+	}
+    return true; // keep parsing
+}
+
 static void discovery_completed(struct bt_gatt_dm *disc, void *ctx)
 {
 	int err;
 
+	/* Must be statically allocated */
 	static struct bt_gatt_subscribe_params param = {
 		.notify = on_received,
 		.value = BT_GATT_CCC_NOTIFY,
@@ -160,85 +260,6 @@ static struct bt_conn_cb conn_callbacks = {
 	.connected = connected,
 };
 
-bool find_adv_data(struct bt_data *data, int *user_data)
-{
-    if(data->type == 22)
-	{
-
-		int  subscriber  = (int)user_data;
-		int oldCounter = subscribed_peers[subscriber].counter;
-  		const uint8_t protocol_version = data->data[2] >> 4;
-		subscribed_peers[subscriber].protocol_version = protocol_version;
-
-
-  		uint8_t counter = data->data[3] & 0x0f;
-		if(oldCounter==counter)
-		{
-			return true;
-		}
-
-		LOG_INF("Counter: %u", counter);
-		subscribed_peers[subscriber].counter = counter;
-
-
-// Some b-parasite versions have an (optional) illuminance sensor.
-  		bool has_illuminance = data->data[2] & 0x1;
-		subscribed_peers[subscriber].has_illuminance = has_illuminance;
-
-		LOG_INF("Illuminance support: %u", has_illuminance);
-  // Counter for deduplicating messages.
-
-	// Battery voltage in millivolts.
-  		uint16_t battery_millivolt = data->data[4] << 8 | data->data[5];
-  		float battery_voltage = battery_millivolt / 1000.0f;
-		LOG_INF("Battery voltage: %.2f", battery_voltage);
-		subscribed_peers[subscriber].battery_voltage = battery_millivolt;
-
-// Temperature in 1000 * Celsius (protocol v1) or 100 * Celsius (protocol v2).
-  		float temp_celsius;
-	//	uint16_t temp_millicelsius;
-  		if (protocol_version == 1) {
-    		uint16_t temp_millicelsius = data->data[6] << 8 | data->data[7];
-    		temp_celsius = temp_millicelsius / 1000.0f;
-  		} else {
-    		int16_t temp_centicelsius = data->data[6] << 8 | data->data[7];
-    		temp_celsius = temp_centicelsius / 100.0f;
-  		}
-		LOG_INF("Temp: %.2f", temp_celsius);
-		subscribed_peers[subscriber].temp_celsius = temp_celsius;
-
-// Relative air humidity in the range [0, 2^16).
-  		uint16_t humidity = data->data[8] << 8 | data->data[9];
-  		float humidity_percent = (100.0f * humidity) / (1 << 16);
-		LOG_INF("Humidity: %.2f", humidity_percent);
-		subscribed_peers[subscriber].humidity_percent = humidity_percent;
-
-  // Relative soil moisture in [0 - 2^16).
-  		uint16_t soil_moisture = data->data[10] << 8 | data->data[11];
-  		float moisture_percent = (100.0f * soil_moisture) / (1 << 16);
-		LOG_INF("Moisture: %.2f", moisture_percent);
-		subscribed_peers[subscriber].moisture_percent = moisture_percent;
-
-  // Ambient light in lux.
-  		float illuminance = has_illuminance ? data->data[18] << 8 | data->data[19] : 0.0f;
-		LOG_INF("Illuminance: %.2f", illuminance);
-		subscribed_peers[subscriber].illuminance = illuminance;
-
-
-		if(date_time_is_valid())
-		{
-			int64_t timestamp;
-			date_time_now(&timestamp);
-			LOG_INF("DateTime valid");
-			subscribed_peers[subscriber].has_timestamp = true;
-			subscribed_peers[subscriber].timestamp = timestamp;
-		}
-	
-	}
-    return true; // keep parsing
-}
-
-
 void scan_filter_match(struct bt_scan_device_info *device_info,
 		       struct bt_scan_filter_match *filter_match,
 		       bool connectable)
@@ -271,10 +292,9 @@ void scan_filter_match(struct bt_scan_device_info *device_info,
 		}
 
 
-    bt_data_parse(device_info->adv_data, find_adv_data, counter);
+    bt_data_parse(device_info->adv_data, find_adv_data, (void *)counter);
 
 }
-
 
 void scan_connecting_error(struct bt_scan_device_info *device_info)
 {
@@ -318,6 +338,7 @@ static void scan_start(void)
 		LOG_ERR("Scanning filters cannot be set (err %d)", err);
 		return;
 	}
+
 	err = bt_scan_filter_enable(BT_SCAN_SHORT_NAME_FILTER, false);
 	if (err) {
 		LOG_ERR("Filters cannot be turned on");
@@ -338,9 +359,10 @@ static void ble_ready(int err)
 	scan_start();
 }
 
-void ble_init()
+void ble_init(void)
 {
 	int err;
+
 	LOG_INF("Initializing Bluetooth..");
 	err = bt_enable(ble_ready);
 	if (err) {

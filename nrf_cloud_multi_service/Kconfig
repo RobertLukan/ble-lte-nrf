@@ -4,7 +4,6 @@
 # SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
 #
 
-
 menu "UDP Sample Settings"
 
 config UDP_DATA_UPLOAD_SIZE_BYTES
@@ -37,26 +36,14 @@ endmenu
 
 module = UDP
 module-str = UDP sample
-source "${ZEPHYR_BASE}/subsys/logging/Kconfig.template.log_config"
 
 
-menu "MQTT Multi Service Sample Settings"
+
+menu "Multi Service Sample Settings"
 
 config APP_VERSION
-	string "MQTT Multi Service Sample version"
+	string "Multi Service Sample version"
 	default "1.0.0"
-
-config POWER_SAVING_MODE_ENABLE
-	bool "Enable Power Saving Mode (PSM)"
-	help
-	  Enable to request Power Saving Mode from cellular network.
-
-config LTE_INIT_RETRY_TIMEOUT_SECONDS
-	int "LTE initialization retry timeout (seconds)"
-	default 30
-	help
-	  Sets the number of seconds between each LTE modem initialization
-	  retry.
 
 config CLOUD_CONNECTION_RETRY_TIMEOUT_SECONDS
 	int "Cloud connection retry timeout (seconds)"
@@ -64,13 +51,6 @@ config CLOUD_CONNECTION_RETRY_TIMEOUT_SECONDS
 	help
 	  If connecting to nRF Cloud takes longer than this timeout, it will be
 	  reattempted.
-
-config CLOUD_CONNECTION_REESTABLISH_DELAY_SECONDS
-	int "Cloud connection reestablishment delay (seconds)"
-	default 5
-	help
-	  After the connection to nRF Cloud has been reset, wait this amount of
-	  time before attempting to connect again.
 
 config CLOUD_READY_TIMEOUT_SECONDS
 	int "Cloud readiness timeout (seconds)"
@@ -109,16 +89,17 @@ config MESSAGE_THREAD_STACK_SIZE
 
 config LED_THREAD_STACK_SIZE
 	int "LED Thread Stack Size (bytes)"
-	default 512
+	default 1024
 	help
 	  Sets the stack size (in bytes) for the LED thread.
 
 config MAX_OUTGOING_MESSAGES
 	int "Outgoing message maximum"
-	default 64
+	default 50
 	help
 	  Sets the maximum number of device messages which may be enqueued
 	  before further messages are dropped.
+	  Increasing this value may require an increase to CONFIG_HEAP_MEM_POOL_SIZE.
 
 config MAX_CONSECUTIVE_SEND_FAILURES
 	int "Max outgoing consecutive send failures"
@@ -140,6 +121,15 @@ config SENSOR_SAMPLE_INTERVAL_SECONDS
 	default 60
 	help
 	  Sets the time to wait between each sensor sample.
+
+menuconfig LOCATION_TRACKING
+	bool "Location tracking service"
+	default y
+	help
+	  Uses GNSS, LTE, and/or Wi-Fi information to determine and report device
+	  location.
+
+if LOCATION_TRACKING
 
 config LOCATION_TRACKING_SAMPLE_INTERVAL_SECONDS
 	int "Location sampling interval (seconds)"
@@ -169,6 +159,8 @@ config LOCATION_TRACKING_WIFI
 	  Requires the use of an nRF7002 companion chip.
 	  Disable all location tracking methods to completely disable location tracking.
 
+endif
+
 config TEMP_DATA_USE_SENSOR
 	bool "Use genuine temperature data"
 	depends on BOARD_THINGY91_NRF9160_NS
@@ -195,7 +187,7 @@ config TEMP_ALERT_LIMIT
 choice
 	prompt "LED indication"
 	default LED_INDICATION_PWM if BOARD_THINGY91_NRF9160_NS
-	default LED_INDICATION_GPIO if BOARD_NRF9160DK_NRF9160_NS || $(dt_compat_enabled,gpio-leds)
+	default LED_INDICATION_GPIO if BOARD_NRF9160DK_NRF9160_NS || BOARD_NRF9161DK_NRF9161_NS || $(dt_compat_enabled,gpio-leds)
 	default LED_INDICATION_DISABLED
 
 	config LED_INDICATION_PWM
@@ -259,6 +251,7 @@ config TEST_COUNTER
 	bool "Sets whether the test counter is enabled"
 
 config AT_CMD_REQUESTS
+	depends on !NRF_CLOUD_COAP
 	bool "Enables remote execution of AT commands using device messages"
 	default y
 
@@ -270,10 +263,107 @@ config AT_CMD_REQUEST_RESPONSE_BUFFER_LENGTH
 	  error code sent in its place (-NRF_E2BIG). Cannot be less than 40 bytes.
 	default 200
 
+if NRF_CLOUD_COAP
+
+menuconfig COAP_FOTA
+	bool "FOTA service when using CoAP to connect to nRF Cloud"
+	select FOTA_DOWNLOAD
+	select FOTA_DOWNLOAD_PROGRESS_EVT
+	select IMG_ERASE_PROGRESSIVELY
+	select DFU_TARGET
+	select DOWNLOAD_CLIENT
+	select REBOOT
+	select CJSON_LIB
+	select SETTINGS
+	default y
+
+if COAP_FOTA
+
+config COAP_FOTA_DL_TIMEOUT_MIN
+	int "The time (minutes) allotted for a FOTA download to complete"
+	default 15
+	help
+	  If the FOTA download does not complete in the allotted time,
+	  the download will be cancelled and the job status will be
+	  set as failed.
+
+config COAP_FOTA_USE_NRF_CLOUD_SETTINGS_AREA
+	bool "Use the same settings area as the nRF Cloud FOTA library"
+	default y
+	help
+	  Using the same settings area as the nRF Cloud FOTA library will
+	  allow this sample to perform application-FOTA updates to applications
+	  built with CONFIG_NRF_CLOUD_FOTA enabled.
+
+config COAP_FOTA_SETTINGS_NAME
+	depends on !COAP_FOTA_USE_NRF_CLOUD_SETTINGS_AREA
+	string "Settings identifier for the COAP FOTA sample"
+	default "coap_fota_sample"
+	help
+	  The root settings identifier for this application.
+	  For application-FOTA, this value should also be found in your target application
+	  so that the FOTA status can be properly reported to nRF Cloud.
+
+config COAP_FOTA_SETTINGS_KEY_PENDING_JOB
+	depends on !COAP_FOTA_USE_NRF_CLOUD_SETTINGS_AREA
+	string "Settings item key for pending FOTA job info"
+	default "pending_job"
+	help
+	  The settings item key where pending FOTA job info will be stored.
+	  For application-FOTA, this value should also be found in your target application
+	  so that the FOTA status can be properly reported to nRF Cloud.
+
+config COAP_FOTA_JOB_CHECK_RATE_MINUTES
+	int "FOTA job check interval (minutes)"
+	default 60
+	help
+	  Sets the time to wait between each request to get any pending FOTA job.
+
+config COAP_FOTA_THREAD_STACK_SIZE
+	int "CoAP FOTA Thread Stack Size (bytes)"
+	default 2048
+	help
+	  Sets the stack size (in bytes) for the CoAP FOTA thread of the
+	  sample.
+
+endif
+
+menuconfig COAP_SHADOW
+	bool "Updating shadow service"
+	default y
+	help
+	  Updates the shadow with device information. Checks for a shadow
+	  delta periodically and processes it if received.
+
+if COAP_SHADOW
+
+config COAP_SHADOW_CHECK_RATE_SECONDS
+	int "Shadow job check interval (seconds)"
+	default 300
+	help
+	  Sets the time to wait between each request to get any change to the
+	  device shadow.
+
+config COAP_SHADOW_THREAD_STACK_SIZE
+	int "CoAP Shadow Thread Stack Size (bytes)"
+	default 3072
+	help
+	  Sets the stack size (in bytes) for the CoAP shadow thread of the
+	  sample.
+
+endif
+
+endif
+
 endmenu
 
-module = MQTT_MULTI_SERVICE
+if NRF_CLOUD_MQTT
 module-str = MQTT Multi Service
+endif
+if NRF_CLOUD_COAP
+module-str = CoAP Multi Service
+endif
+module = MULTI_SERVICE
 source "${ZEPHYR_BASE}/subsys/logging/Kconfig.template.log_config"
 
 menu "Zephyr Kernel"

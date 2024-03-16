@@ -8,15 +8,12 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
 #include <modem/location.h>
-#include <modem/nrf_modem_lib.h>
-#include <nrf_modem_at.h>
 #include <date_time.h>
-#include <net/nrf_cloud_agnss.h>
-#include <net/nrf_cloud_pgps.h>
+#include <modem/lte_lc.h>
 
 #include "location_tracking.h"
 
-LOG_MODULE_REGISTER(location_tracking, CONFIG_MQTT_MULTI_SERVICE_LOG_LEVEL);
+LOG_MODULE_REGISTER(location_tracking, CONFIG_MULTI_SERVICE_LOG_LEVEL);
 
 static location_update_cb_t location_update_handler;
 static bool location_initialized;
@@ -50,12 +47,32 @@ static void location_event_handler(const struct location_event_data *event_data)
 	}
 }
 
+static void enable_modem_gnss(void)
+{
+	if (IS_ENABLED(CONFIG_LTE_LINK_CONTROL)) {
+		int err = lte_lc_func_mode_set(LTE_LC_FUNC_MODE_ACTIVATE_GNSS);
+
+		if (err) {
+			LOG_ERR("Activating GNSS failed, error: %d. Continuing without GNSS", err);
+		}
+	} else {
+		LOG_WRN("CONFIG_LTE_LINK_CONTROL must be enabled in order to use GNSS");
+	}
+}
+
 int start_location_tracking(location_update_cb_t handler_cb, int interval)
 {
 	int err;
 
+	LOG_DBG("Starting location tracking");
+
 	if (!date_time_is_valid()) {
 		LOG_WRN("Date and time unknown. Location Services results may suffer");
+	}
+
+	/* Enable GNSS on the modem if appropriate */
+	if (IS_ENABLED(CONFIG_LOCATION_TRACKING_GNSS)) {
+		enable_modem_gnss();
 	}
 
 	/* Update the location update handler. */
@@ -96,6 +113,13 @@ int start_location_tracking(location_update_cb_t handler_cb, int interval)
 
 	/* Load default settings accordingly */
 	location_config_defaults_set(&config, ARRAY_SIZE(methods), methods);
+
+	/* Set the mode to walk through all methods. This ensures all methods
+	 * are tested and demonstrated.
+	 * In a real product, the default is the better option to use, since the location
+	 * library will try them in priority order.
+	 */
+	config.mode = LOCATION_REQ_MODE_ALL;
 
 	/* Set the location report interval. */
 	config.interval = interval;
